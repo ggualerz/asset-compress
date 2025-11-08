@@ -206,7 +206,7 @@ compress_brotli() {
   local src="$1"
   local dst="$2"
   local quality="${BROTLI_QUALITY:-11}"
-  brotli --force -q "$quality" --output "$dst" "$src"
+  brotli --force -q "$quality" --output="$dst" "$src"
 }
 
 for target in "${targets[@]}"; do
