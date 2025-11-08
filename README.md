@@ -1,7 +1,7 @@
 # README — asset-compress
 
 Pre-compress static assets to Brotli (`.br`) and Gzip (`.gz`) variants. Minimal, non-root, CI-friendly.
-Base image: **SUSE BCI Base 16.0-10.3**
+Base image: **SUSE BCI Base**
 
 ## What it does
 
