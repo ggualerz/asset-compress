@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="/work"
+
+DEFAULT_EXTENSIONS=(
+  css
+  html
+  htm
+  js
+  mjs
+  cjs
+  json
+  svg
+  xml
+  txt
+  csv
+  tsv
+  map
+  wasm
+  jsx
+  tsx
+  ts
+  ico
+  rss
+  atom
+  ndjson
+  webmanifest
+)
+
+EXCLUDE_PATHS=()
+if [[ -d "${ROOT_DIR%/}/lost+found" ]]; then
+  EXCLUDE_PATHS+=("${ROOT_DIR%/}/lost+found")
+fi
+
+log() {
+  printf '[asset-compress] %s\n' "$*" >&2
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+  if ! command_exists "$1"; then
+    log "$1 not found on PATH"
+    exit 1
+  fi
+}
+
+needs_rebuild() {
+  local source="$1"
+  local target="$2"
+  [[ ! -f "$target" || "$source" -nt "$target" ]]
+}
+
+normalize_path() {
+  local target="$1"
+  if [[ "$target" == /* ]]; then
+    printf '%s\n' "$target"
+  else
+    printf '%s\n' "${ROOT_DIR%/}/$target"
+  fi
+}
+
+parse_extensions() {
+  local raw="$1"
+  local -a parsed=()
+  local IFS=','
+  for token in $raw; do
+    token="${token// /}"
+    if [[ -n "$token" ]]; then
+      parsed+=("$token")
+    fi
+  done
+  printf '%s\n' "${parsed[@]}"
+}
+
+collect_extensions() {
+  local -a extensions=("${DEFAULT_EXTENSIONS[@]}")
+  if [[ -n "${ASSET_EXTENSIONS:-}" ]]; then
+    mapfile -t user_ext < <(parse_extensions "$ASSET_EXTENSIONS")
+    if ((${#user_ext[@]})); then
+      extensions=("${user_ext[@]}")
+    fi
+  fi
+  if [[ -n "${ADDITIONAL_EXTENSIONS:-}" ]]; then
+    mapfile -t extra_ext < <(parse_extensions "$ADDITIONAL_EXTENSIONS")
+    extensions+=("${extra_ext[@]}")
+  fi
+  local -a normalized=()
+  for ext in "${extensions[@]}"; do
+    ext="${ext#.}"
+    ext="${ext,,}"
+    if [[ -n "$ext" ]]; then
+      normalized+=("$ext")
+    fi
+  done
+  printf '%s\n' "${normalized[@]}"
+}
+
+build_find_command() {
+  local -n out=$1
+  local dir="$2"
+  out=(find "$dir")
+  for exclude in "${EXCLUDE_PATHS[@]}"; do
+    out+=(-path "$exclude" -prune -o)
+  done
+  local -a patterns
+  for ext in "${EXTENSION_LIST[@]}"; do
+    patterns+=(-o -iname "*.${ext}")
+  done
+  if ((${#patterns[@]})); then
+    patterns=(${patterns[@]:1})
+  fi
+  out+=(-type f ! -iname '*.gz' ! -iname '*.br' \( "${patterns[@]}" \) -print0)
+}
+
+find_assets() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    log "Skipping missing directory $dir"
+    return
+  fi
+  local -a cmd
+  build_find_command cmd "$dir"
+  "${cmd[@]}" 2>/dev/null
+}
+
+collect_all() {
+  local -a cmd
+  build_find_command cmd "$ROOT_DIR"
+  "${cmd[@]}" 2>/dev/null
+}
+
+require_command brotli
+if [[ "${PREFER_PIGZ:-}" == "1" ]]; then
+  require_command pigz
+else
+  require_command gzip
+fi
+
+mapfile -t EXTENSION_LIST < <(collect_extensions)
+readonly -a EXTENSION_LIST
+
+is_supported_file() {
+  local file="$1"
+  case "${file,,}" in
+    *.gz|*.br)
+      return 1
+      ;;
+  esac
+  local ext="${file##*.}"
+  if [[ "$ext" == "$file" ]]; then
+    return 1
+  fi
+  ext="${ext,,}"
+  for candidate in "${EXTENSION_LIST[@]}"; do
+    if [[ "$ext" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+mapfile -d '' -t targets < <(
+  if [[ "$#" -eq 0 ]]; then
+    collect_all | sort -z
+  else
+    for arg in "$@"; do
+      abs=$(normalize_path "$arg")
+      if [[ -d "$abs" ]]; then
+        find_assets "$abs"
+      else
+        if [[ -f "$abs" ]]; then
+          if is_supported_file "$abs"; then
+            printf '%s\0' "$abs"
+          else
+            log "Skipping unsupported file $arg"
+          fi
+        else
+          log "Skipping missing path $arg"
+        fi
+      fi
+    done | sort -z
+  fi
+)
+
+if [[ "${#targets[@]}" -eq 0 ]]; then
+  log "No assets found to compress"
+  exit 0
+fi
+
+compress_gzip() {
+  local src="$1"
+  local dst="$2"
+  local level="${GZIP_LEVEL:-9}"
+  if [[ "${PREFER_PIGZ:-}" == "1" ]]; then
+    pigz --keep --force -${level} --processes "${PIGZ_PROCESSES:-0}" --stdout "$src" > "$dst"
+  else
+    gzip --keep --force -${level} --stdout "$src" > "$dst"
+  fi
+}
+
+compress_brotli() {
+  local src="$1"
+  local dst="$2"
+  local quality="${BROTLI_QUALITY:-11}"
+  brotli --force -q "$quality" --output "$dst" "$src"
+}
+
+for target in "${targets[@]}"; do
+  rel="${target#$ROOT_DIR/}"
+  dir="$(dirname "$rel")"
+  base="$(basename "$rel")"
+  pretty_dir="${dir#./}"
+  if [[ -z "$pretty_dir" || "$pretty_dir" == "." ]]; then
+    pretty_dir="."
+  fi
+
+  if [[ "$dir" == "." ]]; then
+    target_dir="${ROOT_DIR%/}"
+  else
+    target_dir="${ROOT_DIR%/}/$dir"
+  fi
+
+  gz="${target_dir}/${base}.gz"
+  br="${target_dir}/${base}.br"
+
+  if needs_rebuild "$target" "$gz"; then
+    log "Generating ${pretty_dir}/${base}.gz"
+    tmp_gz="${gz}.tmp$$"
+    compress_gzip "$target" "$tmp_gz"
+    mv -f "$tmp_gz" "$gz"
+  else
+    log "Skipping up-to-date ${rel} -> ${base}.gz"
+  fi
+
+  if needs_rebuild "$target" "$br"; then
+    log "Generating ${pretty_dir}/${base}.br"
+    tmp_br="${br}.tmp$$"
+    compress_brotli "$target" "$tmp_br"
+    mv -f "$tmp_br" "$br"
+  else
+    log "Skipping up-to-date ${rel} -> ${base}.br"
+  fi
+
+done
