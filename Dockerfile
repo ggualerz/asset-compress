@@ -31,7 +31,8 @@ RUN zypper --non-interactive ref && \
       bash \
       coreutils \
       findutils \
-      gawk && \
+      gawk \
+      brotli && \
     zypper clean -a
 
 COPY --from=builder /opt/tools /opt/tools
